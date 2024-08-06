@@ -47,6 +47,7 @@
 #include <syslog.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <sys/select.h>
 #ifdef USE_SYSTEMD
 #include <systemd/sd-daemon.h>
 #endif
@@ -252,18 +253,27 @@ int create_socket(int port) {
     return server_sock;
 }
 
-/* Send log message to stderr or syslog */
+/* Send log message to /tmp/proxy.log or syslog */
 void plog(int priority, const char *format, ...)
 {
     va_list ap;
+    FILE *log_file;
 
     va_start(ap, format);
 
     if (use_syslog) {
         vsyslog(priority, format, ap);
     } else {
-        vfprintf(stderr, format, ap);
-        fprintf(stderr, "\n");
+        log_file = fopen("/tmp/proxy.log", "a");  // Open the file in append mode
+        if (log_file != NULL) {
+            vfprintf(log_file, format, ap);
+            fprintf(log_file, "\n");
+            fclose(log_file);
+        } else {
+            // Fallback to stderr if file opening fails
+            vfprintf(stderr, format, ap);
+            fprintf(stderr, "\n");
+        }
     }
 
     va_end(ap);
@@ -392,39 +402,74 @@ void forward_data(int source_sock, int destination_sock) {
 /* Forward data between sockets through external command */
 void forward_data_ext(int source_sock, int destination_sock, char *cmd) {
     char buffer[BUF_SIZE];
-    int n, i, pipe_in[2], pipe_out[2];
-
-    if (pipe(pipe_in) < 0 || pipe(pipe_out) < 0) { // create command input and output pipes
+    int n, i, pipe_in[2], pipe_out[2], pipe_err[2];
+    if (pipe(pipe_in) < 0 || pipe(pipe_out) < 0 || pipe(pipe_err) < 0) {
         plog(LOG_CRIT, "Cannot create pipe: %m");
         exit(CREATE_PIPE_ERROR);
     }
-
     if (fork() == 0) {
-        dup2(pipe_in[READ], STDIN_FILENO); // replace standard input with input part of pipe_in
-        dup2(pipe_out[WRITE], STDOUT_FILENO); // replace standard output with output part of pipe_out
-        close(pipe_in[WRITE]); // close unused end of pipe_in
-        close(pipe_out[READ]); // close unused end of pipe_out
-        n = system(cmd); // execute command
+        dup2(pipe_in[READ], STDIN_FILENO);
+        dup2(pipe_out[WRITE], STDOUT_FILENO);
+        dup2(pipe_err[WRITE], STDERR_FILENO);
+        close(pipe_in[WRITE]);
+        close(pipe_out[READ]);
+        close(pipe_err[READ]);
+        n = system(cmd);
         exit(n);
     } else {
-        close(pipe_in[READ]); // no need to read from input pipe here
-        close(pipe_out[WRITE]); // no need to write to output pipe here
+        close(pipe_in[READ]);
+        close(pipe_out[WRITE]);
+        close(pipe_err[WRITE]);
+        fd_set read_fds;
+        int max_fd = pipe_out[READ] > pipe_err[READ] ? pipe_out[READ] : pipe_err[READ];
+        max_fd = max_fd > source_sock ? max_fd : source_sock;
 
-        while ((n = recv(source_sock, buffer, BUF_SIZE, 0)) > 0) { // read data from input socket
-            if (write(pipe_in[WRITE], buffer, n) < 0) { // write data to input pipe of external command
-                plog(LOG_ERR, "Cannot write to pipe: %m");
-                exit(BROKEN_PIPE_ERROR);
+        while (1) {
+            FD_ZERO(&read_fds);
+            FD_SET(pipe_out[READ], &read_fds);
+            FD_SET(pipe_err[READ], &read_fds);
+            FD_SET(source_sock, &read_fds);
+
+            if (select(max_fd + 1, &read_fds, NULL, NULL, NULL) < 0) {
+                plog(LOG_ERR, "Select error: %m");
+                exit(1);
             }
-            if ((i = read(pipe_out[READ], buffer, BUF_SIZE)) > 0) { // read command output
-                send(destination_sock, buffer, i, 0); // send data to output socket
+
+            if (FD_ISSET(source_sock, &read_fds)) {
+                n = recv(source_sock, buffer, BUF_SIZE, 0);
+                if (n <= 0) break;  // End of input or error
+                if (write(pipe_in[WRITE], buffer, n) < 0) {
+                    plog(LOG_ERR, "Cannot write to pipe: %m");
+                    exit(BROKEN_PIPE_ERROR);
+                }
+            }
+
+            if (FD_ISSET(pipe_out[READ], &read_fds)) {
+                i = read(pipe_out[READ], buffer, BUF_SIZE);
+                if (i > 0) {
+                    send(destination_sock, buffer, i, 0);
+                } else if (i == 0) {
+                    // EOF on stdout
+                    break;
+                }
+            }
+
+            if (FD_ISSET(pipe_err[READ], &read_fds)) {
+                i = read(pipe_err[READ], buffer, BUF_SIZE);
+                if (i > 0) {
+                    send(source_sock, buffer, i, 0);
+                }
             }
         }
 
-        shutdown(destination_sock, SHUT_RDWR); // stop other processes from using socket
+        // Cleanup
+        shutdown(destination_sock, SHUT_RDWR);
         close(destination_sock);
-
-        shutdown(source_sock, SHUT_RDWR); // stop other processes from using socket
+        shutdown(source_sock, SHUT_RDWR);
         close(source_sock);
+        close(pipe_in[WRITE]);
+        close(pipe_out[READ]);
+        close(pipe_err[READ]);
     }
 }
 
