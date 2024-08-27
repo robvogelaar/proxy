@@ -1,8 +1,8 @@
 /*
  * Tiny TCP proxy server
  *
- * Author: Krzysztof Kli≈õ <krzysztof.klis@gmail.com>
- * Fixes and improvements: J√©r√¥me Poulin <jeromepoulin@gmail.com>
+ * Author: Krzysztof Klis <krzysztof.klis@gmail.com>
+ * Fixes and improvements: JÈrÙme Poulin <jeromepoulin@gmail.com>
  * IPv6 support: 04/2019 Rafael Ferrari <rafaelbf@hotmail.com>
  *
  * This program is free software: you can redistribute it and/or modify
@@ -48,6 +48,7 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <sys/select.h>
+#include <sys/un.h>  // Add support for UNIX domain sockets
 #ifdef USE_SYSTEMD
 #include <systemd/sd-daemon.h>
 #endif
@@ -85,6 +86,7 @@ void plog(int priority, const char *format, ...);
 int server_sock, client_sock, remote_sock, remote_port = 0;
 int connections_processed = 0;
 char *bind_addr, *remote_host, *cmd_in, *cmd_out;
+char *local_domain_socket = NULL, *remote_domain_socket = NULL;
 bool foreground = FALSE;
 bool use_syslog = FALSE;
 
@@ -99,8 +101,8 @@ int main(int argc, char *argv[]) {
 
     local_port = parse_options(argc, argv);
 
-    if (local_port < 0) {
-        printf("Syntax: %s [-b bind_address] -l local_port -h remote_host -p remote_port [-i \"input parser\"] [-o \"output parser\"] [-f (stay in foreground)] [-s (use syslog)]\n", argv[0]);
+    if (local_port < 0 && !local_domain_socket) {
+        printf("Syntax: %s [-b bind_address] -l local_port -h remote_host -p remote_port [-i \"input parser\"] [-o \"output parser\"] [-f (stay in foreground)] [-s (use syslog)] [-L local_domain_socket] [-R remote_domain_socket]\n", argv[0]);
         return local_port;
     }
 
@@ -142,7 +144,7 @@ int main(int argc, char *argv[]) {
 int parse_options(int argc, char *argv[]) {
     int c, local_port = 0;
 
-    while ((c = getopt(argc, argv, "b:l:h:p:i:o:fs")) != -1) {
+    while ((c = getopt(argc, argv, "b:l:h:p:i:o:fsL:R:")) != -1) {  // Add new options -L and -R for domain sockets
         switch(c) {
             case 'l':
                 local_port = atoi(optarg);
@@ -168,10 +170,16 @@ int parse_options(int argc, char *argv[]) {
             case 's':
                 use_syslog = TRUE;
                 break;
+            case 'L':
+                local_domain_socket = optarg;
+                break;
+            case 'R':
+                remote_domain_socket = optarg;
+                break;
         }
     }
 
-    if (local_port && remote_host && remote_port) {
+    if ((local_port && remote_host && remote_port) || local_domain_socket || remote_domain_socket) {
         return local_port;
     } else {
         return SYNTAX_ERROR;
@@ -194,60 +202,87 @@ int check_ipversion(char * address)
     return 0;
 }
 
+
 /* Create server socket */
 int create_socket(int port) {
     int server_sock, optval = 1;
     int validfamily=0;
     struct addrinfo hints, *res=NULL;
+    struct sockaddr_un local;
     char portstr[12];
 
-    memset(&hints, 0x00, sizeof(hints));
-    server_sock = -1;
-
-    hints.ai_flags    = AI_NUMERICSERV;   /* numeric service number, not resolve */
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-
-    /* prepare to bind on specified numeric address */
-    if (bind_addr != NULL) {
-        /* check for numeric IP to specify IPv6 or IPv4 socket */
-        if (validfamily = check_ipversion(bind_addr)) {
-             hints.ai_family = validfamily;
-             hints.ai_flags |= AI_NUMERICHOST; /* bind_addr is a valid numeric ip, skip resolve */
+    if (local_domain_socket) {
+        // Domain socket creation
+        if ((server_sock = socket(AF_UNIX, SOCK_STREAM, 0)) < 0) {
+            return SERVER_SOCKET_ERROR;
         }
-    } else {
-        /* if bind_address is NULL, will bind to IPv6 wildcard */
-        hints.ai_family = AF_INET6; /* Specify IPv6 socket, also allow ipv4 clients */
-        hints.ai_flags |= AI_PASSIVE; /* Wildcard address */
-    }
 
-    sprintf(portstr, "%d", port);
+        memset(&local, 0, sizeof(local));
+        local.sun_family = AF_UNIX;
+        strncpy(local.sun_path, local_domain_socket, sizeof(local.sun_path) - 1);
 
-    /* Check if specified socket is valid. Try to resolve address if bind_address is a hostname */
-    if (getaddrinfo(bind_addr, portstr, &hints, &res) != 0) {
-        return CLIENT_RESOLVE_ERROR;
-    }
+        unlink(local_domain_socket);  // Remove any existing socket
 
-    if ((server_sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol)) < 0) {
-        return SERVER_SOCKET_ERROR;
-    }
-
-
-    if (setsockopt(server_sock, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) < 0) {
-        return SERVER_SETSOCKOPT_ERROR;
-    }
-
-    if (bind(server_sock, res->ai_addr, res->ai_addrlen) == -1) {
+        if (bind(server_sock, (struct sockaddr *)&local, sizeof(local)) < 0) {
             close(server_sock);
-        return SERVER_BIND_ERROR;
-    }
+            return SERVER_BIND_ERROR;
+        }
 
-    if (listen(server_sock, BACKLOG) < 0) {
-        return SERVER_LISTEN_ERROR;
-    }
+        if (listen(server_sock, BACKLOG) < 0) {
+            perror("Error listening on UNIX socket");
+            close(server_sock);
+            return SERVER_LISTEN_ERROR;
+        }
 
-    if (res != NULL) {
-        freeaddrinfo(res);
+    } else {
+        // Existing IPv4/IPv6 socket creation...
+        memset(&hints, 0x00, sizeof(hints));
+        server_sock = -1;
+
+        hints.ai_flags    = AI_NUMERICSERV;   /* numeric service number, not resolve */
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+
+        /* prepare to bind on specified numeric address */
+        if (bind_addr != NULL) {
+            /* check for numeric IP to specify IPv6 or IPv4 socket */
+            if (validfamily = check_ipversion(bind_addr)) {
+                hints.ai_family = validfamily;
+                hints.ai_flags |= AI_NUMERICHOST; /* bind_addr is a valid numeric ip, skip resolve */
+            }
+        } else {
+            /* if bind_address is NULL, will bind to IPv6 wildcard */
+            hints.ai_family = AF_INET6; /* Specify IPv6 socket, also allow ipv4 clients */
+            hints.ai_flags |= AI_PASSIVE; /* Wildcard address */
+        }
+
+        sprintf(portstr, "%d", port);
+
+        /* Check if specified socket is valid. Try to resolve address if bind_address is a hostname */
+        if (getaddrinfo(bind_addr, portstr, &hints, &res) != 0) {
+            return CLIENT_RESOLVE_ERROR;
+        }
+
+        if ((server_sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol)) < 0) {
+            return SERVER_SOCKET_ERROR;
+        }
+
+        if (setsockopt(server_sock, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) < 0) {
+            return SERVER_SETSOCKOPT_ERROR;
+        }
+
+        if (bind(server_sock, res->ai_addr, res->ai_addrlen) == -1) {
+            close(server_sock);
+            return SERVER_BIND_ERROR;
+        }
+
+        if (listen(server_sock, BACKLOG) < 0) {
+            return SERVER_LISTEN_ERROR;
+        }
+
+        if (res != NULL) {
+            freeaddrinfo(res);
+        }
     }
 
     return server_sock;
@@ -359,45 +394,35 @@ cleanup:
 /* Forward data between sockets */
 void forward_data(int source_sock, int destination_sock) {
     ssize_t n;
-
-#ifdef USE_SPLICE
-    int buf_pipe[2];
-
-    if (pipe(buf_pipe) == -1) {
-        plog(LOG_ERR, "pipe: %m");
-        exit(CREATE_PIPE_ERROR);
-    }
-
-    while ((n = splice(source_sock, NULL, buf_pipe[WRITE], NULL, SSIZE_MAX, SPLICE_F_NONBLOCK|SPLICE_F_MOVE)) > 0) {
-        if (splice(buf_pipe[READ], NULL, destination_sock, NULL, SSIZE_MAX, SPLICE_F_MOVE) < 0) {
-            plog(LOG_ERR, "write: %m");
-            exit(BROKEN_PIPE_ERROR);
-        }
-    }
-#else
     char buffer[BUF_SIZE];
 
-    while ((n = recv(source_sock, buffer, BUF_SIZE, 0)) > 0) { // read data from input socket
-        send(destination_sock, buffer, n, 0); // send data to output socket
+    while ((n = recv(source_sock, buffer, BUF_SIZE, 0)) > 0) {
+        printf("Forwarding %ld bytes from source to destination\n", n);
+
+        if (send(destination_sock, buffer, n, 0) < 0) {
+            perror("Error sending data");
+            printf("Failed to send %ld bytes to destination\n", n);
+            exit(BROKEN_PIPE_ERROR);
+        }
+        printf("Successfully forwarded %ld bytes\n", n);
     }
-#endif
 
     if (n < 0) {
-        plog(LOG_ERR, "read: %m");
+        perror("Error reading data");
+        printf("Failed to read data from source\n");
         exit(BROKEN_PIPE_ERROR);
+    } else if (n == 0) {
+        printf("No more data to forward (source closed connection)\n");
     }
 
-#ifdef USE_SPLICE
-    close(buf_pipe[0]);
-    close(buf_pipe[1]);
-#endif
-
-    shutdown(destination_sock, SHUT_RDWR); // stop other processes from using socket
+    shutdown(destination_sock, SHUT_RDWR);
     close(destination_sock);
 
-    shutdown(source_sock, SHUT_RDWR); // stop other processes from using socket
+    shutdown(source_sock, SHUT_RDWR);
     close(source_sock);
+    printf("Closed both source and destination sockets\n");
 }
+
 
 /* Forward data between sockets through external command */
 void forward_data_ext(int source_sock, int destination_sock, char *cmd) {
@@ -438,6 +463,7 @@ void forward_data_ext(int source_sock, int destination_sock, char *cmd) {
             if (FD_ISSET(source_sock, &read_fds)) {
                 n = recv(source_sock, buffer, BUF_SIZE, 0);
                 if (n <= 0) break;  // End of input or error
+                // plog(LOG_INFO, "recv source_sock, write pipe_in (%d)\n", n);
                 if (write(pipe_in[WRITE], buffer, n) < 0) {
                     plog(LOG_ERR, "Cannot write to pipe: %m");
                     exit(BROKEN_PIPE_ERROR);
@@ -446,6 +472,7 @@ void forward_data_ext(int source_sock, int destination_sock, char *cmd) {
 
             if (FD_ISSET(pipe_out[READ], &read_fds)) {
                 i = read(pipe_out[READ], buffer, BUF_SIZE);
+                // plog(LOG_INFO, "read pipe_out, send destination_sock(%d)\n", i);
                 if (i > 0) {
                     send(destination_sock, buffer, i, 0);
                 } else if (i == 0) {
@@ -456,6 +483,7 @@ void forward_data_ext(int source_sock, int destination_sock, char *cmd) {
 
             if (FD_ISSET(pipe_err[READ], &read_fds)) {
                 i = read(pipe_err[READ], buffer, BUF_SIZE);
+                // plog(LOG_INFO, "read pipe_err, send source_sock(%d)\n", i);
                 if (i > 0) {
                     send(source_sock, buffer, i, 0);
                 }
@@ -473,43 +501,61 @@ void forward_data_ext(int source_sock, int destination_sock, char *cmd) {
     }
 }
 
+
 /* Create client connection */
 int create_connection() {
     struct addrinfo hints, *res=NULL;
+    struct sockaddr_un remote;
     int sock;
     int validfamily=0;
     char portstr[12];
 
-    memset(&hints, 0x00, sizeof(hints));
+    if (remote_domain_socket) {
+        // Domain socket creation
+        if ((sock = socket(AF_UNIX, SOCK_STREAM, 0)) < 0) {
+            return CLIENT_SOCKET_ERROR;
+        }
 
-    hints.ai_flags    = AI_NUMERICSERV; /* numeric service number, not resolve */
-    hints.ai_family   = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
+        memset(&remote, 0, sizeof(remote));
+        remote.sun_family = AF_UNIX;
+        strncpy(remote.sun_path, remote_domain_socket, sizeof(remote.sun_path) - 1);
 
-    sprintf(portstr, "%d", remote_port);
+        if (connect(sock, (struct sockaddr *)&remote, sizeof(remote)) < 0) {
+            return CLIENT_CONNECT_ERROR;
+        }
+    } else {
+        // Network socket creation...
+        memset(&hints, 0x00, sizeof(hints));
 
-    /* check for numeric IP to specify IPv6 or IPv4 socket */
-    if (validfamily = check_ipversion(remote_host)) {
-         hints.ai_family = validfamily;
-         hints.ai_flags |= AI_NUMERICHOST;  /* remote_host is a valid numeric ip, skip resolve */
-    }
+        hints.ai_flags    = AI_NUMERICSERV; /* numeric service number, not resolve */
+        hints.ai_family   = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
 
-    /* Check if specified host is valid. Try to resolve address if remote_host is a hostname */
-    if (getaddrinfo(remote_host,portstr , &hints, &res) != 0) {
-        errno = EFAULT;
-        return CLIENT_RESOLVE_ERROR;
-    }
+        sprintf(portstr, "%d", remote_port);
 
-    if ((sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol)) < 0) {
-        return CLIENT_SOCKET_ERROR;
-    }
+        /* check for numeric IP to specify IPv6 or IPv4 socket */
+        if (validfamily = check_ipversion(remote_host)) {
+             hints.ai_family = validfamily;
+             hints.ai_flags |= AI_NUMERICHOST;  /* remote_host is a valid numeric ip, skip resolve */
+        }
 
-    if (connect(sock, res->ai_addr, res->ai_addrlen) < 0) {
-        return CLIENT_CONNECT_ERROR;
-    }
+        /* Check if specified host is valid. Try to resolve address if remote_host is a hostname */
+        if (getaddrinfo(remote_host, portstr, &hints, &res) != 0) {
+            errno = EFAULT;
+            return CLIENT_RESOLVE_ERROR;
+        }
 
-    if (res != NULL) {
-        freeaddrinfo(res);
+        if ((sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol)) < 0) {
+            return CLIENT_SOCKET_ERROR;
+        }
+
+        if (connect(sock, res->ai_addr, res->ai_addrlen) < 0) {
+            return CLIENT_CONNECT_ERROR;
+        }
+
+        if (res != NULL) {
+            freeaddrinfo(res);
+        }
     }
 
     return sock;
