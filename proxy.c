@@ -49,6 +49,7 @@
 #include <sys/wait.h>
 #include <sys/select.h>
 #include <sys/un.h>  // Add support for UNIX domain sockets
+#include <sys/time.h>
 #ifdef USE_SYSTEMD
 #include <systemd/sd-daemon.h>
 #endif
@@ -291,21 +292,37 @@ int create_socket(int port) {
 /* Send log message to /tmp/proxy.log or syslog */
 void plog(int priority, const char *format, ...)
 {
+    static struct timeval first_log_time = {0, 0};
+    struct timeval current_time, delta_time;
     va_list ap;
     FILE *log_file;
 
     va_start(ap, format);
+
+    // Get the current time
+    gettimeofday(&current_time, NULL);
+
+    // Initialize first_log_time with the time of the first log
+    if (first_log_time.tv_sec == 0 && first_log_time.tv_usec == 0) {
+        first_log_time = current_time;
+    }
+
+    // Calculate the delta time
+    timersub(&current_time, &first_log_time, &delta_time);
 
     if (use_syslog) {
         vsyslog(priority, format, ap);
     } else {
         log_file = fopen("/tmp/proxy.log", "a");  // Open the file in append mode
         if (log_file != NULL) {
+            // Print the delta time at the beginning of the log entry
+            fprintf(log_file, "[%ld.%06ld] ", (long)delta_time.tv_sec, (long)delta_time.tv_usec);
             vfprintf(log_file, format, ap);
             fprintf(log_file, "\n");
             fclose(log_file);
         } else {
             // Fallback to stderr if file opening fails
+            fprintf(stderr, "[%ld.%06ld] ", (long)delta_time.tv_sec, (long)delta_time.tv_usec);
             vfprintf(stderr, format, ap);
             fprintf(stderr, "\n");
         }
@@ -342,6 +359,8 @@ void server_loop() {
 #ifdef USE_SYSTEMD
     sd_notify(0, "READY=1\n");
 #endif
+
+    plog(LOG_INFO, "server started");
 
     while (TRUE) {
         update_connection_count();
@@ -397,22 +416,22 @@ void forward_data(int source_sock, int destination_sock) {
     char buffer[BUF_SIZE];
 
     while ((n = recv(source_sock, buffer, BUF_SIZE, 0)) > 0) {
-        printf("Forwarding %ld bytes from source to destination\n", n);
+        plog(LOG_INFO, "Forwarding %ld bytes from source to destination", n);
 
         if (send(destination_sock, buffer, n, 0) < 0) {
             perror("Error sending data");
-            printf("Failed to send %ld bytes to destination\n", n);
+            plog(LOG_INFO, "Failed to send %ld bytes to destination", n);
             exit(BROKEN_PIPE_ERROR);
         }
-        printf("Successfully forwarded %ld bytes\n", n);
+        plog(LOG_INFO, "Successfully forwarded %ld bytes", n);
     }
 
     if (n < 0) {
         perror("Error reading data");
-        printf("Failed to read data from source\n");
+        plog(LOG_INFO, "Failed to read data from source");
         exit(BROKEN_PIPE_ERROR);
     } else if (n == 0) {
-        printf("No more data to forward (source closed connection)\n");
+        plog(LOG_INFO, "No more data to forward (source closed connection)");
     }
 
     shutdown(destination_sock, SHUT_RDWR);
@@ -420,7 +439,7 @@ void forward_data(int source_sock, int destination_sock) {
 
     shutdown(source_sock, SHUT_RDWR);
     close(source_sock);
-    printf("Closed both source and destination sockets\n");
+    plog(LOG_INFO, "Closed both source and destination sockets");
 }
 
 
@@ -463,7 +482,7 @@ void forward_data_ext(int source_sock, int destination_sock, char *cmd) {
             if (FD_ISSET(source_sock, &read_fds)) {
                 n = recv(source_sock, buffer, BUF_SIZE, 0);
                 if (n <= 0) break;  // End of input or error
-                // plog(LOG_INFO, "recv source_sock, write pipe_in (%d)\n", n);
+                plog(LOG_INFO, "recv source_sock, write pipe_in (%d)", n);
                 if (write(pipe_in[WRITE], buffer, n) < 0) {
                     plog(LOG_ERR, "Cannot write to pipe: %m");
                     exit(BROKEN_PIPE_ERROR);
@@ -472,7 +491,7 @@ void forward_data_ext(int source_sock, int destination_sock, char *cmd) {
 
             if (FD_ISSET(pipe_out[READ], &read_fds)) {
                 i = read(pipe_out[READ], buffer, BUF_SIZE);
-                // plog(LOG_INFO, "read pipe_out, send destination_sock(%d)\n", i);
+                plog(LOG_INFO, "read pipe_out, send destination_sock(%d)", i);
                 if (i > 0) {
                     send(destination_sock, buffer, i, 0);
                 } else if (i == 0) {
@@ -483,7 +502,7 @@ void forward_data_ext(int source_sock, int destination_sock, char *cmd) {
 
             if (FD_ISSET(pipe_err[READ], &read_fds)) {
                 i = read(pipe_err[READ], buffer, BUF_SIZE);
-                // plog(LOG_INFO, "read pipe_err, send source_sock(%d)\n", i);
+                plog(LOG_INFO, "read pipe_err, send source_sock(%d)", i);
                 if (i > 0) {
                     send(source_sock, buffer, i, 0);
                 }
